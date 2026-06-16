@@ -1,0 +1,141 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Ex: v1.0.0
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 0. Lint & smoke test the Python daemon
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ruff
+        run: pip install ruff
+
+      - name: Lint
+        run: ruff check cpu_thermal_guard.py
+
+      - name: Byte-compile
+        run: python -m py_compile cpu_thermal_guard.py
+
+      - name: Smoke test (simulated sensor)
+        run: |
+          echo 70000 > /tmp/fakesensor
+          TEMP_INPUT=/tmp/fakesensor python cpu_thermal_guard.py --check
+
+  # 1. Build Arch (.pkg.tar.zst)
+  build-arch:
+    needs: lint
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          pacman -Syu --noconfirm base-devel git
+          useradd builder -m
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chmod -R a+rw .
+
+      - name: Build Package
+        run: |
+          su builder -c "makepkg -s --noconfirm"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-pkg
+          path: ./*.pkg.tar.zst
+          if-no-files-found: error
+
+  # 2. Build Debian (.deb) & RedHat (.rpm)
+  build-deb-rpm:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ruby & FPM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev rubygems build-essential
+          sudo gem install --no-document fpm
+
+      - name: Prepare Build Directory
+        run: |
+          mkdir -p build/usr/bin build/etc build/usr/lib/systemd/system
+          cp cpu_thermal_guard.py build/usr/bin/cpu-thermal-guard
+          cp cpu-thermal-guard.conf build/etc/cpu-thermal-guard.conf
+          cp cpu-thermal-guard.service build/usr/lib/systemd/system/cpu-thermal-guard.service
+          chmod +x build/usr/bin/cpu-thermal-guard
+
+      - name: Build .deb
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="1.0.0" # Fallback for manual runs
+          fpm -s dir -t deb -n cpu-thermal-guard -v "$VERSION" \
+            --description "Sustain-gated NBFC fan pulser" \
+            --depends python3 \
+            --config-files /etc/cpu-thermal-guard.conf \
+            -C build .
+
+      - name: Build .rpm
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -z "$VERSION" ] && VERSION="1.0.0"
+          fpm -s dir -t rpm -n cpu-thermal-guard -v "$VERSION" \
+            --description "Sustain-gated NBFC fan pulser" \
+            --depends python3 \
+            --config-files /etc/cpu-thermal-guard.conf \
+            -C build .
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-rpm-pkg
+          path: |
+            *.deb
+            *.rpm
+          if-no-files-found: error
+
+  release:
+    needs: [build-arch, build-deb-rpm]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Arch Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: arch-pkg
+          path: .
+
+      - name: Download Deb/Rpm Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: deb-rpm-pkg
+          path: .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.pkg.tar.zst
+            *.deb
+            *.rpm
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
