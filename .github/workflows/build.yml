@@ -157,3 +157,5 @@ jobs:
           commit_email: zaujulio.dev@gmail.com
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           commit_message: "Update to ${{ github.ref_name }}"
+          assets: |
+            cpu-thermal-guard.install
